@@ -460,17 +460,18 @@ fn validate_manifest_structure(m: &Manifest) -> Result<(), ManifestParseError> {
     Ok(())
 }
 
-pub struct ManifestHashes<'a> {
+pub struct ManifestHashes {
     // Hashes that are allowed anywhere
-    pub allowed_anywhere_hash_vec: Vec<&'a str>,
+    // They don't need to have a key associated with them.
+    pub allowed_anywhere_hash_vec: Vec<String>,
     // Named hashes (kv : <addresse, hash>)
-    pub asset_hash_vec: BTreeMap<&'a str, &'a str>,
+    pub asset_hash_vec: BTreeMap<String, Vec<String>>,
 
 }
 
 impl Manifest {
     /// The hashes are returned only if the manifest is valid.
-    pub fn get_hashes_from_manifest(&self) -> Result<ManifestHashes<'_>, ManifestParseError> {
+    pub fn get_hashes_from_manifest(&self) -> Result<ManifestHashes, ManifestParseError> {
         validate_manifest_structure(self)?;
 
         let mut asset_hash_vec = BTreeMap::new();
@@ -479,13 +480,12 @@ impl Manifest {
         for (key, value) in &self.hashes {
             if key.is_empty() {
                 match value {
-                    HashValue::One(h) => allowed_anywhere_hash_vec.push(h.as_str()),
-                    HashValue::Many(v) => allowed_anywhere_hash_vec.extend(v.iter().map(|h| h.as_str())),
+                    HashValue::One(h) => allowed_anywhere_hash_vec.push(h.clone()),
+                    HashValue::Many(v) => allowed_anywhere_hash_vec.extend(v.iter().cloned()),
                 }
             } else {
-                // Safe because validation enforces "non-empty key => One"
                 if let HashValue::One(h) = value {
-                    asset_hash_vec.insert(key.as_str(), h.as_str());
+                    asset_hash_vec.insert(key.clone(), vec![h.clone()]);
                 }
             }
         }
@@ -494,6 +494,35 @@ impl Manifest {
     }
 }
 
+fn push_unique(vec: &mut Vec<String>, value: String) {
+    if !vec.iter().any(|v| v == &value) {
+        vec.push(value);
+    }
+}
+
+fn merge_hashes(mut a: ManifestHashes, b: ManifestHashes) -> ManifestHashes {
+    for h in b.allowed_anywhere_hash_vec {
+        push_unique(&mut a.allowed_anywhere_hash_vec, h);
+    }
+
+    for (key, hashes) in b.asset_hash_vec {
+        let entry = a.asset_hash_vec.entry(key).or_default();
+        for h in hashes {
+            push_unique(entry, h);
+        }
+    }
+
+    a
+}
+
+pub fn merge_hashes_from_manifests(
+    m1: &Manifest,
+    m2: &Manifest,
+) -> Result<ManifestHashes, ManifestParseError> {
+    let h1 = m1.get_hashes_from_manifest()?;
+    let h2 = m2.get_hashes_from_manifest()?;
+    Ok(merge_hashes(h1, h2))
+}
 
 #[cfg(test)]
 mod tests {
@@ -530,14 +559,13 @@ mod tests {
         let hashes = manifest.get_hashes_from_manifest().expect("hashes should be valid");
 
         assert_eq!(
-            // Yea, the name could be better...
-            hashes.asset_hash_vec.get("/assets/x.html"),
-            Some(&"ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")
+            hashes.asset_hash_vec.get("/assets/x.html").map(Vec::as_slice),
+            Some(&["ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".to_string()][..])
         );
 
         assert_eq!(
-            hashes.asset_hash_vec.get("/assets/main.js"),
-            Some(&"fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603")
+            hashes.asset_hash_vec.get("/assets/main.js").map(Vec::as_slice),
+            Some(&["fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603".to_string()][..])
         );
 
         // AllowAnywhere hashes
@@ -546,6 +574,79 @@ mod tests {
             hashes.allowed_anywhere_hash_vec[0],
             "3431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
         );
+    }
+
+    #[test]
+    fn valid_manifest_hashes_are_extracted_correctly_merging_two_manifests() {
+        let input = include_str!("../tests/manifests/valid_manifest.json5");
+
+        let manifest = parse_manifest_json5(input).expect("manifest should parse");
+            let merged_hashes =
+        merge_hashes_from_manifests(&manifest, &manifest).expect("merge should succeed");
+
+        let x_html_hashes = merged_hashes.asset_hash_vec
+            .get("/assets/x.html")
+            .expect("expected /assets/x.html to exist");
+
+        assert_eq!(x_html_hashes.len(), 1);
+        assert_eq!(
+            x_html_hashes,
+            &vec![
+                // The same hash should not be duplicated.
+                "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+            ]
+        );
+    }
+
+    #[test]
+    fn valid_manifest_hashes_are_extracted_correctly_merging_two_different_manifests() {
+        let input0 = include_str!("../tests/manifests/valid_manifest.json5");
+        let input1 = include_str!("../tests/manifests/valid_manifest1.json5");
+
+        // The manifest0 is "younger" than manifest1, so its hashes should appear first.
+        let manifest0 = parse_manifest_json5(input0).expect("manifest should parse");
+        let manifest1 = parse_manifest_json5(input1).expect("manifest should parse");
+            let merged_hashes =
+        merge_hashes_from_manifests(&manifest0, &manifest1).expect("merge should succeed");
+
+        let x_html_hashes = merged_hashes.asset_hash_vec
+        .get("/assets/x.html")
+        .expect("expected /assets/x.html to exist");
+
+        assert_eq!(x_html_hashes.len(), 2);
+        assert_eq!(
+            x_html_hashes,
+            &vec![
+                "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+                "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+            ]
+        );
+
+        let main_js_hashes = merged_hashes.asset_hash_vec
+        .get("/assets/main.js")
+        .expect("expected /assets/main.js to exist");
+
+        assert_eq!(main_js_hashes.len(), 2);
+        assert_eq!(
+            main_js_hashes,
+            &vec![
+                "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+                "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+            ]
+        );
+
+        // AllowAnywhere hashes
+        assert_eq!(merged_hashes.allowed_anywhere_hash_vec.len(), 2);
+        assert_eq!(
+            merged_hashes.allowed_anywhere_hash_vec[0],
+            "3431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
+        );
+        assert_eq!(
+            merged_hashes.allowed_anywhere_hash_vec[1],
+            "3ed62ae7fdf42d560a480a282af38b6c8de0a3431742b9dbff1751bba9ba4748"
+        );
+
+
     }
 
     #[test]
