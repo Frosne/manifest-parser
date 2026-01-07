@@ -415,6 +415,7 @@ fn validate_hashes(hashes: &BTreeMap<String, HashValue>) -> Result<(), ManifestP
 
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u32,
 
@@ -427,7 +428,8 @@ pub struct Manifest {
     #[serde(deserialize_with = "deserialize_hashes_no_duplicates")]
     pub hashes: BTreeMap<String, HashValue>,
 
-    pub metadata: serde_json::Value,
+    /// Optional metadata field
+    pub metadata: Option<serde_json::Value>,
 }
 
 pub fn parse_manifest_json5(input: &str) -> Result<Manifest, ManifestParseError> {
@@ -568,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_manifest_unknown_directive() {
+    fn invalid_manifest_unknown_directive_integirity() {
         let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json5");
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
@@ -634,6 +636,28 @@ mod tests {
     #[test]
     fn invalid_manifest_spaces_in_key() {
         let input = include_str!("../tests/manifests/hashes/invalid_manifest_spaces_in_key.json5");
+        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        assert!(
+            matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
+            "expected InvalidStructure, got {:?}",
+            manifest
+        );
+    }
+
+    #[test]
+    fn valid_manifest_metadata_optional() {
+        let input = include_str!("../tests/manifests/valid_manifest_metadata_optional.json5");
+        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        assert!(
+            manifest.is_ok(),
+            "expected Ok, got {:?}",
+            manifest
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_unknown_directive() {
+        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json5");
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),

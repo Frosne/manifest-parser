@@ -1,0 +1,14 @@
+{
+  version: 1,
+  "integrity-policy": "blocked-destinations=(script), checked-destinations=(wasm)",
+  "bt-server": "www.mybt.com/com.whatsapp.www",
+  hashes: {
+    "/assets/x.html": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    "/assets/main.js": "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+    "": [
+      "3431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
+    ],
+  },
+  metadata: "arbitrary data...",
+  redpanda : " ",
+}
