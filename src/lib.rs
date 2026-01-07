@@ -177,11 +177,28 @@ pub fn validate_integrity_policy(input: &str) -> Result<(), IntegrityPolicyParse
     Ok(())
 }
 
+/// (Binary Transparency server)
+fn validate_bt_server(value: &str) -> Result<(), ManifestParseError> {
+    let v = value.trim();
 
-// /// Parses either:
-// /// - "(a b c)" -> ["a","b","c"]   (whitespace-separated)
-// /// - "(a)" -> ["a"]
-// /// - "a" -> ["a"]
+    if v.is_empty() {
+        return Err(ManifestParseError::InvalidStructure {
+            detail: "bt-server must be non-empty".into(),
+        });
+    }
+
+    if v.contains(char::is_whitespace) {
+        return Err(ManifestParseError::InvalidStructure {
+            detail: "bt-server must not contain whitespace".into(),
+        });
+    }
+
+    Ok(())
+}
+
+/// - "(a b c)" -> ["a","b","c"]
+/// - "(a)" -> ["a"]
+/// - "a" -> ["a"]
 fn parse_value_list(raw: &str) -> Result<Vec<String>, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -210,15 +227,41 @@ fn parse_value_list(raw: &str) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
-
-
-
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum HashValue {
     One(String),
     Many(Vec<String>),
 }
+
+/// From the discussion here: https://github.com/w3c/webappsec-subresource-integrity/issues/163
+/// There are 2 possible ways to represent hash values:
+/// 1. As a hex-encoded string of length 64 (representing 32 bytes)
+/// For example: fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603
+/// 2. As an algorithm-prefix followed by a base64-encoded string
+/// For example:
+/// sha256-951GGeIr4ebxasLqO1OxZUtNtdoEemmEyhZD5uC1szg="
+/// is_valid_hex_sha256 checks for the first representation.
+/// is_valid_sri_sha256 checks for the second representation.
+fn is_valid_hex_sha256(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_valid_sri_sha256(s: &str) -> bool {
+    let rest = match s.strip_prefix("sha256-") {
+        Some(r) => r,
+        None => return false,
+    };
+
+    let decoded = match base64::decode(rest) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+
+    decoded.len() == 32
+}
+
+
 
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
@@ -256,6 +299,9 @@ fn validate_manifest_structure(m: &Manifest) -> Result<(), ManifestParseError> {
         detail: format!("invalid integrity-policy: {e:?}"),
     })?;
 
+
+    validate_bt_server(&m.bt_server)?;
+
     Ok(())
 }
 
@@ -271,11 +317,26 @@ mod tests {
     }
 
     #[test]
+    fn valid_manifest_parse_and_validate_ok() {
+        let input = include_str!("../tests/manifests/valid_manifest.json5");
+
+        let manifest = parse_manifest_json5(input)
+            .and_then(|m| validate_manifest_structure(&m));
+
+        assert!(
+            manifest.is_ok(),
+            "expected Ok after parse + validate, got {:?}",
+            manifest
+        );
+    }
+
+    #[test]
     fn valid_changed_order_manifest() {
         let input = include_str!("../tests/manifests/valid_manifest_changed_order.json5");
         let manifest = parse_manifest_json5(input);
         assert!(manifest.is_ok(), "expected Ok, got {:?}", manifest);
     }
+
     #[test]
     fn invalid_manifest_missing_brackets() {
         let input = include_str!("../tests/manifests/invalid_manifest_missing_brackets.json5");
@@ -363,4 +424,31 @@ mod tests {
             manifest
         );
     }
+
+    #[test]
+    fn invalid_manifest_incorrect_bt_server() {
+        let input = include_str!("../tests/manifests/invalid_manifest_incorrect_bt_server.json5");
+        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        assert!(
+            matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
+            "expected InvalidStructure, got {:?}",
+            manifest
+        );
+    }
+
+    #[test]
+    fn valid_sha256_hashes() {
+        let valid_hex = "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603";
+        let valid_sri = "sha256-951GGeIr4ebxasLqO1OxZUtNtdoEemmEyhZD5uC1szg=";
+
+        assert!(is_valid_hex_sha256(valid_hex), "expected valid hex sha256");
+        assert!(is_valid_sri_sha256(valid_sri), "expected valid sri sha256");
+
+        let invalid_hex = "invalidhexstring";
+        let invalid_sri = "sha256-invalidbase64===";
+
+        assert!(!is_valid_hex_sha256(invalid_hex), "expected invalid hex sha256");
+        assert!(!is_valid_sri_sha256(invalid_sri), "expected invalid sri sha256");
+    }
+
 }
