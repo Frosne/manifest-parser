@@ -430,8 +430,29 @@ pub struct Manifest {
 
     /// Optional metadata field
     pub metadata: Option<serde_json::Value>,
+
+    // I've figured out that there might be other fields in the manifest in the future,
+    // for example, "resource_delimeter": "/* MY_DELIM */"
+    // https://github.com/w3c/webappsec-subresource-integrity/issues/163
+    // So we can just remove #[serde(deny_unknown_fields)] in this case
 }
 
+/// Parses this shape of manifests
+///   "manifest": {
+///     "version": 1, // format of the manifest
+///     "integrity-policy": "blocked-destinations=(script), checked-destinations=(wasm)",
+///     "bt-server": "www.mybt.com/com.whatsapp.www ",
+///     "hashes": {
+///       "/assets/x.html": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+///       "/assets/main.js": "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+///       "": [
+///         "3431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
+///       ],
+///     },
+///     "metadata": "arbitrary data... "
+///  },
+/// Should be updated if https://github.com/w3c/webappsec-subresource-integrity/issues/158#issuecomment-3639242927
+///
 pub fn parse_manifest_json5(input: &str) -> Result<Manifest, ManifestParseError> {
     let manifest: Manifest = json5::from_str(input).map_err(|e| ManifestParseError::InvalidSyntax {
         detail: e.to_string(),
@@ -440,14 +461,17 @@ pub fn parse_manifest_json5(input: &str) -> Result<Manifest, ManifestParseError>
     Ok(manifest)
 }
 
+
 fn is_supported_version(version: u32) -> bool {
     matches!(version, 1)
 }
 
 fn validate_manifest_structure(m: &Manifest) -> Result<(), ManifestParseError> {
+    // Only version 1 is supported currently.
     if !is_supported_version(m.version) {
         return Err(ManifestParseError::UnsupportedVersion { version: m.version });
     }
+
 
     validate_integrity_policy(&m.integrity_policy).map_err(|e| ManifestParseError::InvalidStructure {
         detail: format!("invalid integrity-policy: {e:?}"),
@@ -463,6 +487,11 @@ fn validate_manifest_structure(m: &Manifest) -> Result<(), ManifestParseError> {
 pub struct ManifestHashes {
     // Hashes that are allowed anywhere
     // They don't need to have a key associated with them.
+    // Ok, we can do something more complicated like Vec <'a str>
+    // but we might have some lifetime issues.
+    // The current approach copies a lot of stuff, so it's definitely can be improved.
+    //
+    // A list of hashes that can be used for any resource.
     pub allowed_anywhere_hash_vec: Vec<String>,
     // Named hashes (kv : <addresse, hash>)
     pub asset_hash_vec: BTreeMap<String, Vec<String>>,
@@ -480,6 +509,7 @@ impl Manifest {
         for (key, value) in &self.hashes {
             if key.is_empty() {
                 match value {
+                    // TODO: potentially improve the performance by not cloning here.
                     HashValue::One(h) => allowed_anywhere_hash_vec.push(h.clone()),
                     HashValue::Many(v) => allowed_anywhere_hash_vec.extend(v.iter().cloned()),
                 }
