@@ -460,6 +460,41 @@ fn validate_manifest_structure(m: &Manifest) -> Result<(), ManifestParseError> {
     Ok(())
 }
 
+pub struct ManifestHashes<'a> {
+    // Hashes that are allowed anywhere
+    pub allowed_anywhere_hash_vec: Vec<&'a str>,
+    // Named hashes (kv : <addresse, hash>)
+    pub asset_hash_vec: BTreeMap<&'a str, &'a str>,
+
+}
+
+impl Manifest {
+    /// The hashes are returned only if the manifest is valid.
+    pub fn get_hashes_from_manifest(&self) -> Result<ManifestHashes<'_>, ManifestParseError> {
+        validate_manifest_structure(self)?;
+
+        let mut asset_hash_vec = BTreeMap::new();
+        let mut allowed_anywhere_hash_vec = Vec::new();
+
+        for (key, value) in &self.hashes {
+            if key.is_empty() {
+                match value {
+                    HashValue::One(h) => allowed_anywhere_hash_vec.push(h.as_str()),
+                    HashValue::Many(v) => allowed_anywhere_hash_vec.extend(v.iter().map(|h| h.as_str())),
+                }
+            } else {
+                // Safe because validation enforces "non-empty key => One"
+                if let HashValue::One(h) = value {
+                    asset_hash_vec.insert(key.as_str(), h.as_str());
+                }
+            }
+        }
+
+        Ok(ManifestHashes { asset_hash_vec, allowed_anywhere_hash_vec })
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +517,34 @@ mod tests {
             manifest.is_ok(),
             "expected Ok after parse + validate, got {:?}",
             manifest
+        );
+    }
+
+    #[test]
+    fn valid_manifest_hashes_are_extracted_correctly() {
+        let input = include_str!("../tests/manifests/valid_manifest.json5");
+
+        let manifest = parse_manifest_json5(input).expect("manifest should parse");
+
+        // When calling get_hashes, it will also validate the manifest.
+        let hashes = manifest.get_hashes_from_manifest().expect("hashes should be valid");
+
+        assert_eq!(
+            // Yea, the name could be better...
+            hashes.asset_hash_vec.get("/assets/x.html"),
+            Some(&"ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")
+        );
+
+        assert_eq!(
+            hashes.asset_hash_vec.get("/assets/main.js"),
+            Some(&"fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603")
+        );
+
+        // AllowAnywhere hashes
+        assert_eq!(hashes.allowed_anywhere_hash_vec.len(), 1);
+        assert_eq!(
+            hashes.allowed_anywhere_hash_vec[0],
+            "3431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
         );
     }
 
