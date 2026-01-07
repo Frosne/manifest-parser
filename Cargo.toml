@@ -1,0 +1,9 @@
+[package]
+name = "manifest-parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+json5 = "0.4"
+serde_json = "1"
