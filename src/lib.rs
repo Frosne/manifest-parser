@@ -1,8 +1,60 @@
 use std::{error::Error, fmt};
 
-use serde::Deserialize;
 use std::collections::BTreeMap;
 
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+
+/// Ok, here we implement a custom deserializer for the hashes map
+/// that checks for duplicate keys.
+/// Used in the hashes dictionary of the manifest.
+/// For example, this manifest is invalid because "path/to/resource" appears twice:
+/// /// {
+///     {...}
+///     "hashes": {
+///         "path/to/resource": "sha256-abc...",
+///         "path/to/another/resource": [ "sha256-def...", "sha512-ghi..." ],
+///         "path/to/resource": "sha256-jkl..."  <--- duplicate key
+///     },
+/// }
+///
+fn deserialize_hashes_no_duplicates<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, HashValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct HashesVisitor;
+
+    impl<'de> Visitor<'de> for HashesVisitor {
+        type Value = BTreeMap<String, HashValue>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "a map of hashes without duplicate keys")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut out = BTreeMap::<String, HashValue>::new();
+
+            while let Some((k, v)) = map.next_entry::<String, HashValue>()? {
+                if out.contains_key(&k) {
+                    return Err(de::Error::custom(format!(
+                        "duplicate key in hashes: {:?}",
+                        k
+                    )));
+                }
+                out.insert(k, v);
+            }
+
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(HashesVisitor)
+}
 
 #[derive(Debug)]
 pub enum ManifestParseError {
@@ -165,7 +217,7 @@ pub fn validate_integrity_policy(input: &str) -> Result<(), IntegrityPolicyParse
                     }
                 })?;
             }
-            // For now: other directives are just syntax-checked if parenthesized
+            // Any other directives are invalid
             other => {
                 return Err(IntegrityPolicyParseError::InvalidSyntax {
                     detail: format!("unknown directive {other:?}"),
@@ -241,24 +293,123 @@ pub enum HashValue {
 /// 2. As an algorithm-prefix followed by a base64-encoded string
 /// For example:
 /// sha256-951GGeIr4ebxasLqO1OxZUtNtdoEemmEyhZD5uC1szg="
-/// is_valid_hex_sha256 checks for the first representation.
-/// is_valid_sri_sha256 checks for the second representation.
+/// is_valid_hex_sha256 checks for the first representation (sha256 only I believe).
+/// is_valid_sri_hash checks for the second representation (sha256, sha384, sha512).
 fn is_valid_hex_sha256(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn is_valid_sri_sha256(s: &str) -> bool {
-    let rest = match s.strip_prefix("sha256-") {
-        Some(r) => r,
-        None => return false,
+fn is_valid_sri_hash(s: &str) -> bool {
+    // Accept sha256-, sha384-, sha512-
+    let (alg, b64) = if let Some(rest) = s.strip_prefix("sha256-") {
+        ("sha256", rest)
+    } else if let Some(rest) = s.strip_prefix("sha384-") {
+        ("sha384", rest)
+    } else if let Some(rest) = s.strip_prefix("sha512-") {
+        ("sha512", rest)
+    } else {
+        return false;
     };
 
-    let decoded = match base64::decode(rest) {
-        Ok(bytes) => bytes,
+    let bytes = match base64::decode(b64) {
+        Ok(b) => b,
         Err(_) => return false,
     };
 
-    decoded.len() == 32
+    let expected_len = match alg {
+        "sha256" => 32,
+        "sha384" => 48,
+        "sha512" => 64,
+        _ => return false,
+    };
+
+    bytes.len() == expected_len
+}
+
+fn is_valid_hash(s: &str) -> bool {
+    is_valid_hex_sha256(s) || is_valid_sri_hash(s)
+}
+
+/// Validate that the hashes map is non-empty and that all hash values are valid.
+/// A valid hash value is either:
+/// - A hex-encoded sha256 string of length 64
+/// - A sri-format string with sha256, sha384, or sha512 prefix
+/// - A list of the above
+/// Currently there is a support of AllowedAnywhere
+/// that looks like "" followed by a list of hashes.
+/// We also allow it (but the empty string must be present only once).
+/// P.S. We enforce that each key appears only once in the map,
+/// via the custom deserializer above.
+fn validate_hashes(hashes: &BTreeMap<String, HashValue>) -> Result<(), ManifestParseError> {
+    if hashes.is_empty() {
+        return Err(ManifestParseError::InvalidStructure {
+            detail: "hashes must not be empty".into(),
+        });
+    }
+
+    let mut saw_empty_key = false;
+
+    for (key, hv) in hashes {
+        // Disallow whitespace-only keys; "empty" must be exactly "", not "    ".
+        if key.trim().is_empty() && key != "" {
+            return Err(ManifestParseError::InvalidStructure {
+                detail: "hashes key must not be whitespace".into(),
+            });
+        }
+
+        if key == "" {
+            // Empty key: only one allowed.
+            if saw_empty_key {
+                return Err(ManifestParseError::InvalidStructure {
+                    detail: r#"hashes may contain "" key only once"#.into(),
+                });
+            }
+            saw_empty_key = true;
+
+            // It's possible (I believe) that AllowAnywhere can have either a single hash or a list of hashes.
+            match hv {
+                HashValue::One(h) => {
+                    if !is_valid_hash(h) {
+                        return Err(ManifestParseError::InvalidStructure {
+                            detail: format!(r#"invalid hash for "" key: {h:?}"#),
+                        });
+                    }
+                }
+                HashValue::Many(v) => {
+                    if v.is_empty() {
+                        return Err(ManifestParseError::InvalidStructure {
+                            detail: r#"hash list for AllowAnywhere must not be empty"#.into(),
+                        });
+                    }
+                    for h in v {
+                        if !is_valid_hash(h) {
+                            return Err(ManifestParseError::InvalidStructure {
+                                detail: format!(r#"invalid hash in "" list: {h:?}"#),
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // Non-empty key (not AllowAnywhere ones): must be a single hash string.
+            match hv {
+                HashValue::One(h) => {
+                    if !is_valid_hash(h) {
+                        return Err(ManifestParseError::InvalidStructure {
+                            detail: format!("invalid hash for {key:?}: {h:?}"),
+                        });
+                    }
+                }
+                HashValue::Many(_) => {
+                    return Err(ManifestParseError::InvalidStructure {
+                        detail: format!("{key:?}: value must be a single hash string"),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 
@@ -273,6 +424,7 @@ pub struct Manifest {
     #[serde(rename = "bt-server")]
     pub bt_server: String,
 
+    #[serde(deserialize_with = "deserialize_hashes_no_duplicates")]
     pub hashes: BTreeMap<String, HashValue>,
 
     pub metadata: serde_json::Value,
@@ -299,8 +451,9 @@ fn validate_manifest_structure(m: &Manifest) -> Result<(), ManifestParseError> {
         detail: format!("invalid integrity-policy: {e:?}"),
     })?;
 
-
     validate_bt_server(&m.bt_server)?;
+
+    validate_hashes(&m.hashes)?;
 
     Ok(())
 }
@@ -437,18 +590,56 @@ mod tests {
     }
 
     #[test]
-    fn valid_sha256_hashes() {
+    fn valid_sha_hashes() {
         let valid_hex = "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603";
-        let valid_sri = "sha256-951GGeIr4ebxasLqO1OxZUtNtdoEemmEyhZD5uC1szg=";
+        let valid_sri_sha256 = "sha256-951GGeIr4ebxasLqO1OxZUtNtdoEemmEyhZD5uC1szg=";
+        let valid_sri_sha384 = "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let valid_sri_sha512 = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+
 
         assert!(is_valid_hex_sha256(valid_hex), "expected valid hex sha256");
-        assert!(is_valid_sri_sha256(valid_sri), "expected valid sri sha256");
+        assert!(is_valid_sri_hash(valid_sri_sha256), "expected valid sri sha256");
+        assert!(is_valid_sri_hash(valid_sri_sha384), "expected valid sri sha384");
+        assert!(is_valid_sri_hash(valid_sri_sha512), "expected valid sri sha512");
 
         let invalid_hex = "invalidhexstring";
         let invalid_sri = "sha256-invalidbase64===";
 
         assert!(!is_valid_hex_sha256(invalid_hex), "expected invalid hex sha256");
-        assert!(!is_valid_sri_sha256(invalid_sri), "expected invalid sri sha256");
+        assert!(!is_valid_sri_hash(invalid_sri), "expected invalid sri sha256");
+    }
+
+    #[test]
+    fn invalid_manifest_duplicate_hash_key() {
+        let input = include_str!("../tests/manifests/hashes/invalid_manifest_duplicate_hash_key.json5");
+        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        assert!(
+            matches!(manifest, Err(ManifestParseError::InvalidSyntax { .. })),
+            "expected InvalidSyntax, got {:?}",
+            manifest
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_empty_hash() {
+        let input = include_str!("../tests/manifests/hashes/invalid_manifest_empty_hash.json5");
+        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        assert!(
+            matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
+            "expected InvalidStructure, got {:?}",
+            manifest
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_spaces_in_key() {
+        let input = include_str!("../tests/manifests/hashes/invalid_manifest_spaces_in_key.json5");
+        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        assert!(
+            matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
+            "expected InvalidStructure, got {:?}",
+            manifest
+        );
     }
 
 }

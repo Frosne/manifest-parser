@@ -1,0 +1,11 @@
+{
+  version: 1,
+  "integrity-policy": "blocked-destinations=(script)",
+  "bt-server": "www.mybt.com/com.whatsapp.www",
+  hashes: {
+    "": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    "  ": "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+    "/assets/main.js": "1b8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+  },
+  metadata: "arbitrary data...",
+}
