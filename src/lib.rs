@@ -2,31 +2,29 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-use std::{error::Error, fmt};
 
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::ffi::{c_char, CStr};
+use std::fmt;
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use std::ffi::CStr;
-use std::ffi::c_char;
-
-
-
-/// Ok, here we implement a custom deserializer for the hashes map
-/// that checks for duplicate keys.
+/// Custom deserializer for the hashes map that checks for duplicate keys.
+///
 /// Used in the hashes dictionary of the manifest.
 /// For example, this manifest is invalid because "path/to/resource" appears twice:
-/// /// {
-///     {...}
+///
+/// ```json
+/// {
 ///     "hashes": {
 ///         "path/to/resource": "sha256-abc...",
 ///         "path/to/another/resource": [ "sha256-def...", "sha512-ghi..." ],
-///         "path/to/resource": "sha256-jkl..."  <--- duplicate key
-///     },
+///         "path/to/resource": "sha256-jkl..."  // <--- duplicate key
+///     }
 /// }
-///
+/// ```
 fn deserialize_hashes_no_duplicates<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<String, HashValue>, D::Error>
@@ -68,19 +66,13 @@ where
 #[derive(Debug)]
 pub enum ManifestParseError {
     /// The manifest text could not be parsed as JSON
-    InvalidSyntax {
-        detail: String,
-    },
+    InvalidSyntax { detail: String },
 
     /// The parsed data does not conform to the manifest schema
-    InvalidStructure {
-        detail: String,
-    },
+    InvalidStructure { detail: String },
 
     /// The manifest version is not supported by this implementation
-    UnsupportedVersion {
-        version: u32,
-    },
+    UnsupportedVersion { version: u32 },
 }
 
 impl fmt::Display for ManifestParseError {
@@ -118,8 +110,8 @@ pub enum IntegrityPolicyParseError {
 /// https://www.w3.org/TR/sri-2/
 ///
 /// If dictionary["blocked-destinations"] exists:
-///     If its value contains "script", append "script" to integrityPolicy’s blocked destinations.
-///     If its value contains "style", append "style" to integrityPolicy’s blocked destinations.
+///     If its value contains "script", append "script" to integrityPolicy's blocked destinations.
+///     If its value contains "style", append "style" to integrityPolicy's blocked destinations.
 /// (AW: We don't append anything, just checking that it parses correctly.)
 
 /// AW: Btw, it's unclear if blocked-destinations are optional or mandatory. From the sri-2 spec,
@@ -145,7 +137,7 @@ fn validate_blocked_destinations(raw_value: &str) -> Result<(), IntegrityPolicyP
 }
 
 /// If dictionary["sources"] does not exist or if its value contains "inline",
-/// append "inline" to integrityPolicy’s sources.
+/// append "inline" to integrityPolicy's sources.
 /// (AW: We don't append anything, just checking that it parses correctly.)
 fn validate_sources(raw_value: &str) -> Result<(), IntegrityPolicyParseError> {
     let values = parse_value_list(raw_value).map_err(|detail| {
@@ -157,9 +149,7 @@ fn validate_sources(raw_value: &str) -> Result<(), IntegrityPolicyParseError> {
     for v in values {
         if v != "inline" {
             return Err(IntegrityPolicyParseError::InvalidSyntax {
-                detail: format!(
-                    "invalid sources value {v:?} (allowed: inline)"
-                ),
+                detail: format!("invalid sources value {v:?} (allowed: inline)"),
             });
         }
     }
@@ -168,17 +158,18 @@ fn validate_sources(raw_value: &str) -> Result<(), IntegrityPolicyParseError> {
 }
 
 /// If dictionary["endpoints"] exists:
-///     Set integrityPolicy’s endpoints to dictionary['endpoints'].
+///     Set integrityPolicy's endpoints to dictionary['endpoints'].
 ///
 fn validate_endpoints(raw_value: &str) -> Result<(), IntegrityPolicyParseError> {
-    parse_value_list(raw_value).map_err(|detail| {
-        IntegrityPolicyParseError::InvalidSyntax {
-            detail: format!("{detail} (directive \"endpoints\")"),
-        }
+    parse_value_list(raw_value).map_err(|detail| IntegrityPolicyParseError::InvalidSyntax {
+        detail: format!("{detail} (directive \"endpoints\")"),
     })?;
     Ok(())
 }
 
+/// Validates the integrity policy string.
+///
+/// Reference: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Integrity-Policy
 pub fn validate_integrity_policy(input: &str) -> Result<(), IntegrityPolicyParseError> {
     let s = input.trim();
     if s.is_empty() {
@@ -206,12 +197,11 @@ pub fn validate_integrity_policy(input: &str) -> Result<(), IntegrityPolicyParse
             });
         }
 
-        // https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Integrity-Policy
         match name {
             "blocked-destinations" => {
                 validate_blocked_destinations(raw_value)?;
             }
-             "sources" => {
+            "sources" => {
                 validate_sources(raw_value)?;
             }
             "endpoints" => {
@@ -226,7 +216,6 @@ pub fn validate_integrity_policy(input: &str) -> Result<(), IntegrityPolicyParse
                     }
                 })?;
             }
-            // Any other directives are invalid
             other => {
                 return Err(IntegrityPolicyParseError::InvalidSyntax {
                     detail: format!("unknown directive {other:?}"),
@@ -257,6 +246,9 @@ fn validate_bt_server(value: &str) -> Result<(), ManifestParseError> {
     Ok(())
 }
 
+/// Parses a value list from a directive value.
+///
+/// Examples:
 /// - "(a b c)" -> ["a","b","c"]
 /// - "(a)" -> ["a"]
 /// - "a" -> ["a"]
@@ -387,7 +379,7 @@ fn validate_hashes(hashes: &BTreeMap<String, HashValue>) -> Result<(), ManifestP
                 HashValue::Many(v) => {
                     if v.is_empty() {
                         return Err(ManifestParseError::InvalidStructure {
-                            detail: r#"hash list for AllowAnywhere must not be empty"#.into(),
+                            detail: r#"hash list for AllowedAnywhere must not be empty"#.into(),
                         });
                     }
                     for h in v {
@@ -420,8 +412,6 @@ fn validate_hashes(hashes: &BTreeMap<String, HashValue>) -> Result<(), ManifestP
 
     Ok(())
 }
-
-
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -463,13 +453,13 @@ pub struct Manifest {
 /// Should be updated if https://github.com/w3c/webappsec-subresource-integrity/issues/158#issuecomment-3639242927
 ///
 pub fn parse_manifest_json5(input: &str) -> Result<Manifest, ManifestParseError> {
-    let manifest: Manifest = json5::from_str(input).map_err(|e| ManifestParseError::InvalidSyntax {
-        detail: e.to_string(),
-    })?;
+    let manifest: Manifest =
+        json5::from_str(input).map_err(|e| ManifestParseError::InvalidSyntax {
+            detail: e.to_string(),
+        })?;
 
     Ok(manifest)
 }
-
 
 fn is_supported_version(version: u32) -> bool {
     matches!(version, 1)
@@ -478,16 +468,18 @@ fn is_supported_version(version: u32) -> bool {
 fn validate_manifest_structure(m: &Manifest) -> Result<(), ManifestParseError> {
     // Only version 1 is supported currently.
     if !is_supported_version(m.version) {
-        return Err(ManifestParseError::UnsupportedVersion { version: m.version });
+        return Err(ManifestParseError::UnsupportedVersion {
+            version: m.version,
+        });
     }
 
-
-    validate_integrity_policy(&m.integrity_policy).map_err(|e| ManifestParseError::InvalidStructure {
-        detail: format!("invalid integrity-policy: {e:?}"),
+    validate_integrity_policy(&m.integrity_policy).map_err(|e| {
+        ManifestParseError::InvalidStructure {
+            detail: format!("invalid integrity-policy: {e:?}"),
+        }
     })?;
 
     validate_bt_server(&m.bt_server)?;
-
     validate_hashes(&m.hashes)?;
 
     Ok(())
@@ -504,7 +496,6 @@ pub struct ManifestHashes {
     pub allowed_anywhere_hash_vec: Vec<String>,
     // Named hashes (kv : <addresse, hash>)
     pub asset_hash_vec: BTreeMap<String, Vec<String>>,
-
 }
 
 impl Manifest {
@@ -523,13 +514,17 @@ impl Manifest {
                     HashValue::Many(v) => allowed_anywhere_hash_vec.extend(v.iter().cloned()),
                 }
             } else {
+                // Named resource
                 if let HashValue::One(h) = value {
                     asset_hash_vec.insert(key.clone(), vec![h.clone()]);
                 }
             }
         }
 
-        Ok(ManifestHashes { asset_hash_vec, allowed_anywhere_hash_vec })
+        Ok(ManifestHashes {
+            asset_hash_vec,
+            allowed_anywhere_hash_vec,
+        })
     }
 }
 
@@ -554,6 +549,7 @@ fn merge_hashes(mut a: ManifestHashes, b: ManifestHashes) -> ManifestHashes {
     a
 }
 
+/// Merges hashes from two manifests, removing duplicates.
 pub fn merge_hashes_from_manifests(
     m1: &Manifest,
     m2: &Manifest,
@@ -577,10 +573,7 @@ mod tests {
     #[test]
     fn valid_manifest_parse_and_validate_ok() {
         let input = include_str!("../tests/manifests/valid_manifest.json5");
-
-        let manifest = parse_manifest_json5(input)
-            .and_then(|m| validate_manifest_structure(&m));
-
+        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             manifest.is_ok(),
             "expected Ok after parse + validate, got {:?}",
@@ -591,23 +584,34 @@ mod tests {
     #[test]
     fn valid_manifest_hashes_are_extracted_correctly() {
         let input = include_str!("../tests/manifests/valid_manifest.json5");
-
         let manifest = parse_manifest_json5(input).expect("manifest should parse");
-
-        // When calling get_hashes, it will also validate the manifest.
-        let hashes = manifest.get_hashes_from_manifest().expect("hashes should be valid");
+        let hashes = manifest
+            .get_hashes_from_manifest()
+            .expect("hashes should be valid");
 
         assert_eq!(
-            hashes.asset_hash_vec.get("/assets/x.html").map(Vec::as_slice),
-            Some(&["ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".to_string()][..])
+            hashes
+                .asset_hash_vec
+                .get("/assets/x.html")
+                .map(Vec::as_slice),
+            Some(
+                &["ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+                    .to_string()][..]
+            )
         );
 
         assert_eq!(
-            hashes.asset_hash_vec.get("/assets/main.js").map(Vec::as_slice),
-            Some(&["fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603".to_string()][..])
+            hashes
+                .asset_hash_vec
+                .get("/assets/main.js")
+                .map(Vec::as_slice),
+            Some(
+                &["fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603"
+                    .to_string()][..]
+            )
         );
 
-        // AllowAnywhere hashes
+        // AllowedAnywhere hashes
         assert_eq!(hashes.allowed_anywhere_hash_vec.len(), 1);
         assert_eq!(
             hashes.allowed_anywhere_hash_vec[0],
@@ -618,22 +622,19 @@ mod tests {
     #[test]
     fn valid_manifest_hashes_are_extracted_correctly_merging_two_manifests() {
         let input = include_str!("../tests/manifests/valid_manifest.json5");
-
         let manifest = parse_manifest_json5(input).expect("manifest should parse");
-            let merged_hashes =
-        merge_hashes_from_manifests(&manifest, &manifest).expect("merge should succeed");
+        let merged_hashes =
+            merge_hashes_from_manifests(&manifest, &manifest).expect("merge should succeed");
 
-        let x_html_hashes = merged_hashes.asset_hash_vec
+        let x_html_hashes = merged_hashes
+            .asset_hash_vec
             .get("/assets/x.html")
             .expect("expected /assets/x.html to exist");
 
         assert_eq!(x_html_hashes.len(), 1);
         assert_eq!(
             x_html_hashes,
-            &vec![
-                // The same hash should not be duplicated.
-                "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
-            ]
+            &vec!["ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",]
         );
     }
 
@@ -645,12 +646,13 @@ mod tests {
         // The manifest0 is "younger" than manifest1, so its hashes should appear first.
         let manifest0 = parse_manifest_json5(input0).expect("manifest should parse");
         let manifest1 = parse_manifest_json5(input1).expect("manifest should parse");
-            let merged_hashes =
-        merge_hashes_from_manifests(&manifest0, &manifest1).expect("merge should succeed");
+        let merged_hashes =
+            merge_hashes_from_manifests(&manifest0, &manifest1).expect("merge should succeed");
 
-        let x_html_hashes = merged_hashes.asset_hash_vec
-        .get("/assets/x.html")
-        .expect("expected /assets/x.html to exist");
+        let x_html_hashes = merged_hashes
+            .asset_hash_vec
+            .get("/assets/x.html")
+            .expect("expected /assets/x.html to exist");
 
         assert_eq!(x_html_hashes.len(), 2);
         assert_eq!(
@@ -661,9 +663,10 @@ mod tests {
             ]
         );
 
-        let main_js_hashes = merged_hashes.asset_hash_vec
-        .get("/assets/main.js")
-        .expect("expected /assets/main.js to exist");
+        let main_js_hashes = merged_hashes
+            .asset_hash_vec
+            .get("/assets/main.js")
+            .expect("expected /assets/main.js to exist");
 
         assert_eq!(main_js_hashes.len(), 2);
         assert_eq!(
@@ -674,7 +677,7 @@ mod tests {
             ]
         );
 
-        // AllowAnywhere hashes
+        // AllowedAnywhere hashes
         assert_eq!(merged_hashes.allowed_anywhere_hash_vec.len(), 2);
         assert_eq!(
             merged_hashes.allowed_anywhere_hash_vec[0],
@@ -684,8 +687,6 @@ mod tests {
             merged_hashes.allowed_anywhere_hash_vec[1],
             "3ed62ae7fdf42d560a480a282af38b6c8de0a3431742b9dbff1751bba9ba4748"
         );
-
-
     }
 
     #[test]
@@ -708,10 +709,14 @@ mod tests {
 
     #[test]
     fn invalid_manifest_unsupported_version() {
-        let input = include_str!("../tests/manifests/invalid_manifest_unsupported_version.json5");
+        let input =
+            include_str!("../tests/manifests/invalid_manifest_unsupported_version.json5");
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
-            matches!(manifest, Err(ManifestParseError::UnsupportedVersion { .. })),
+            matches!(
+                manifest,
+                Err(ManifestParseError::UnsupportedVersion { .. })
+            ),
             "expected UnsupportedVersion, got {:?}",
             manifest
         );
@@ -741,7 +746,9 @@ mod tests {
 
     #[test]
     fn invalid_manifest_empty_integrity_policy() {
-        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_empty_integrity_policy.json5");
+        let input = include_str!(
+            "../tests/manifests/integrity-policy/invalid_manifest_empty_integrity_policy.json5"
+        );
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
@@ -752,7 +759,9 @@ mod tests {
 
     #[test]
     fn invalid_manifest_missing_equals() {
-        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_missing_equals.json5");
+        let input = include_str!(
+            "../tests/manifests/integrity-policy/invalid_manifest_missing_equals.json5"
+        );
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
@@ -763,7 +772,9 @@ mod tests {
 
     #[test]
     fn invalid_manifest_sources_bad_value() {
-        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_sources_bad_value.json5");
+        let input = include_str!(
+            "../tests/manifests/integrity-policy/invalid_manifest_sources_bad_value.json5"
+        );
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
@@ -773,8 +784,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_manifest_unknown_directive_integirity() {
-        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json5");
+    fn invalid_manifest_unknown_directive_integrity() {
+        let input = include_str!(
+            "../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json5"
+        );
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
@@ -798,25 +811,41 @@ mod tests {
     fn valid_sha_hashes() {
         let valid_hex = "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603";
         let valid_sri_sha256 = "sha256-951GGeIr4ebxasLqO1OxZUtNtdoEemmEyhZD5uC1szg=";
-        let valid_sri_sha384 = "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let valid_sri_sha384 =
+            "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let valid_sri_sha512 = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
-
         assert!(is_valid_hex_sha256(valid_hex), "expected valid hex sha256");
-        assert!(is_valid_sri_hash(valid_sri_sha256), "expected valid sri sha256");
-        assert!(is_valid_sri_hash(valid_sri_sha384), "expected valid sri sha384");
-        assert!(is_valid_sri_hash(valid_sri_sha512), "expected valid sri sha512");
+        assert!(
+            is_valid_sri_hash(valid_sri_sha256),
+            "expected valid sri sha256"
+        );
+        assert!(
+            is_valid_sri_hash(valid_sri_sha384),
+            "expected valid sri sha384"
+        );
+        assert!(
+            is_valid_sri_hash(valid_sri_sha512),
+            "expected valid sri sha512"
+        );
 
         let invalid_hex = "invalidhexstring";
         let invalid_sri = "sha256-invalidbase64===";
 
-        assert!(!is_valid_hex_sha256(invalid_hex), "expected invalid hex sha256");
-        assert!(!is_valid_sri_hash(invalid_sri), "expected invalid sri sha256");
+        assert!(
+            !is_valid_hex_sha256(invalid_hex),
+            "expected invalid hex sha256"
+        );
+        assert!(
+            !is_valid_sri_hash(invalid_sri),
+            "expected invalid sri sha256"
+        );
     }
 
     #[test]
     fn invalid_manifest_duplicate_hash_key() {
-        let input = include_str!("../tests/manifests/hashes/invalid_manifest_duplicate_hash_key.json5");
+        let input =
+            include_str!("../tests/manifests/hashes/invalid_manifest_duplicate_hash_key.json5");
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidSyntax { .. })),
@@ -838,7 +867,8 @@ mod tests {
 
     #[test]
     fn invalid_manifest_spaces_in_key() {
-        let input = include_str!("../tests/manifests/hashes/invalid_manifest_spaces_in_key.json5");
+        let input =
+            include_str!("../tests/manifests/hashes/invalid_manifest_spaces_in_key.json5");
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
@@ -851,16 +881,14 @@ mod tests {
     fn valid_manifest_metadata_optional() {
         let input = include_str!("../tests/manifests/valid_manifest_metadata_optional.json5");
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
-        assert!(
-            manifest.is_ok(),
-            "expected Ok, got {:?}",
-            manifest
-        );
+        assert!(manifest.is_ok(), "expected Ok, got {:?}", manifest);
     }
 
     #[test]
     fn invalid_manifest_unknown_directive() {
-        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json5");
+        let input = include_str!(
+            "../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json5"
+        );
         let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
@@ -868,7 +896,6 @@ mod tests {
             manifest
         );
     }
-
 }
 
 #[repr(C)]
@@ -881,11 +908,8 @@ pub enum ManifestErrorCode {
     InvalidEncoding = 5,
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn manifest_validate(
-    data: *const c_char,
-    data_len: u32,
-) -> ManifestErrorCode {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn manifest_validate(data: *const c_char, data_len: u32) -> ManifestErrorCode {
     if data.is_null() {
         return ManifestErrorCode::NullPointer;
     }
@@ -906,13 +930,10 @@ pub unsafe extern "C" fn manifest_validate(
     // Parse the manifest
     match parse_manifest_json5(manifest_str) {
         Ok(_manifest) => ManifestErrorCode::Success,
-        Err(e) => {
-            use crate::ManifestParseError;
-            match e {
-                ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
-                ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
-                ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
-            }
-        }
+        Err(e) => match e {
+            ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
+            ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
+            ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
+        },
     }
 }
