@@ -1,0 +1,13 @@
+{
+  version: 1,
+  "integrity-policy": "blocked-destinations=(script), checked-destinations=(wasm)",
+  "bt-server": "www.mybt.com/com.whatsapp.www",
+  hashes: {
+    "": [
+      "5431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a",
+      "4431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a",
+      "3431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
+    ],
+  },
+  metadata: "arbitrary data...",
+}

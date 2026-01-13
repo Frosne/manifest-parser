@@ -5,8 +5,10 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, CStr, CString};
 use std::fmt;
+use std::ptr;
+
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -521,6 +523,9 @@ impl Manifest {
             }
         }
 
+        // Pay attention, here we sort the hashes
+        allowed_anywhere_hash_vec.sort();
+
         Ok(ManifestHashes {
             asset_hash_vec,
             allowed_anywhere_hash_vec,
@@ -896,6 +901,33 @@ mod tests {
             manifest
         );
     }
+
+    #[test]
+    fn valid_manifest_sorting_anywhere_hashed(){
+        let input = include_str!("../tests/manifests/valid_manifest_sorting_anywhere_hashes.json5");
+        let manifest = parse_manifest_json5(input).expect("manifest should parse");
+        let hashes = manifest
+            .get_hashes_from_manifest()
+            .expect("hashes should be valid");
+
+        // AllowedAnywhere hashes should be sorted
+        assert_eq!(hashes.allowed_anywhere_hash_vec.len(), 3);
+
+        assert_eq!(
+            hashes.allowed_anywhere_hash_vec[0],
+            "3431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
+        );
+
+        assert_eq!(
+            hashes.allowed_anywhere_hash_vec[1],
+            "4431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
+        );
+
+        assert_eq!(
+            hashes.allowed_anywhere_hash_vec[2],
+            "5431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
+        );
+    }
 }
 
 #[repr(C)]
@@ -909,7 +941,7 @@ pub enum ManifestErrorCode {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn manifest_validate(data: *const c_char, data_len: u32) -> ManifestErrorCode {
+pub unsafe extern "C" fn manifest_validate(data: *const c_char, data_len: u32) -> ManifestErrorCode { unsafe {
     if data.is_null() {
         return ManifestErrorCode::NullPointer;
     }
@@ -936,4 +968,213 @@ pub unsafe extern "C" fn manifest_validate(data: *const c_char, data_len: u32) -
             ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
         },
     }
+}}
+
+
+#[repr(C)]
+pub struct AssetHashPair {
+    // asset path
+    pub path: *const c_char,
+    // hash value
+    pub hash: *const c_char,
 }
+
+#[repr(C)]
+pub struct AssetHashPairs {
+    /// Number of pairs
+    pub count: u32,
+    /// Array of AssetHashPair structs
+    pub pairs: *const AssetHashPair,
+}
+
+/// Flattened structure containing allowed-anywhere hashes
+#[repr(C)]
+pub struct AllowedAnywhereHashes {
+    /// Number of hashes
+    pub count: u32,
+    /// Array of hashes (null-terminated C strings)
+    pub hashes: *const *const c_char,
+}
+pub struct ManifestHashesHandle {
+    // Store (path, hash) pairs as CStrings
+    asset_pairs: Vec<(CString, CString)>,
+    // Store allowed-anywhere hashes as CStrings
+    allowed_anywhere: Vec<CString>,
+}
+
+#[unsafe(no_mangle)]
+/// Parse a manifest and extract hashes
+/// 
+/// # Safety
+/// - `data` must be a valid pointer to a null-terminated C string
+/// - `data_len` is the length of the data in bytes
+/// - `out_hashes` must be a valid pointer to write the result
+/// - The returned handle must be freed with `manifest_hashes_free`
+/// #[unsafe(no_mangle)]
+pub unsafe extern "C" fn manifest_parse_and_get_hashes(
+    data: *const c_char,
+    data_len: u32,
+    out_hashes: *mut *mut ManifestHashesHandle,
+) -> ManifestErrorCode { unsafe {
+    // Check for null pointers
+    if data.is_null() || out_hashes.is_null() {
+        return ManifestErrorCode::NullPointer;
+    }
+
+    // Convert C string to Rust string
+    let manifest_str = if data_len > 0 {
+        let slice = std::slice::from_raw_parts(data as *const u8, data_len as usize);
+        match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return ManifestErrorCode::InvalidEncoding,
+        }
+    } else {
+        match CStr::from_ptr(data).to_str() {
+            Ok(s) => s,
+            Err(_) => return ManifestErrorCode::InvalidEncoding,
+        }
+    };
+
+    // Parse the manifest
+    let manifest = match parse_manifest_json5(manifest_str) {
+        Ok(m) => m,
+        Err(e) => {
+            use crate::ManifestParseError;
+            return match e {
+                ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
+                ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
+                ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
+            };
+        }
+    };
+
+    // Get hashes from manifest
+    let hashes = match manifest.get_hashes_from_manifest() {
+        Ok(h) => h,
+        Err(e) => {
+            use crate::ManifestParseError;
+            return match e {
+                ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
+                ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
+                ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
+            };
+        }
+    };
+
+    // Convert to CStrings and build pairs
+    // Note: Each asset path maps to exactly one hash (takes first hash from vec)
+    let mut asset_pairs = Vec::new();
+
+    for (path, hash_vec) in &hashes.asset_hash_vec {
+        // Take the first hash - per validation rules, assets should only have one hash
+        if let Some(hash) = hash_vec.first() {
+            if let (Ok(path_cstr), Ok(hash_cstr)) = (CString::new(path.as_str()), CString::new(hash.as_str())) {
+                asset_pairs.push((path_cstr, hash_cstr));
+            }
+        }
+    }
+
+    // Convert allowed-anywhere hashes to CStrings
+    let mut allowed_anywhere = Vec::new();
+
+    for hash in &hashes.allowed_anywhere_hash_vec {
+        if let Ok(hash_cstr) = CString::new(hash.as_str()) {
+            allowed_anywhere.push(hash_cstr);
+        }
+    }
+
+    // Create handle and return
+    let handle = Box::new(ManifestHashesHandle {
+        asset_pairs,
+        allowed_anywhere,
+    });
+    *out_hashes = Box::into_raw(handle);
+    ManifestErrorCode::Success
+}}
+
+/// Get asset hash pairs
+///
+/// # Safety
+/// - `hashes` must be a valid ManifestHashesHandle pointer
+/// - The returned structure's pointers are valid as long as the ManifestHashesHandle is alive
+/// - Do NOT free individual strings or the array - they're owned by the handle
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn manifest_hashes_get_asset_pairs(
+    hashes: *const ManifestHashesHandle,
+) -> AssetHashPairs { unsafe {
+    if hashes.is_null() {
+        return AssetHashPairs {
+            count: 0,
+            pairs: ptr::null(),
+        };
+    }
+
+    let handle = &*hashes;
+    
+    // Build array of AssetHashPair structs with pointers into our CStrings
+    let mut pairs: Vec<AssetHashPair> = Vec::with_capacity(handle.asset_pairs.len());
+    for (path_cstr, hash_cstr) in &handle.asset_pairs {
+        pairs.push(AssetHashPair {
+            path: path_cstr.as_ptr(),
+            hash: hash_cstr.as_ptr(),
+        });
+    }
+    
+    // Leak the Vec so the pointers remain valid
+    // They'll be cleaned up when the handle is freed
+    let pairs_ptr = pairs.as_ptr();
+    let count = pairs.len() as u32;
+    std::mem::forget(pairs);
+    
+    AssetHashPairs {
+        count,
+        pairs: pairs_ptr,
+    }
+}}
+
+/// Get allowed-anywhere hashes
+///
+/// # Safety
+/// - `hashes` must be a valid ManifestHashesHandle pointer
+/// - The returned structure's pointers are valid as long as the ManifestHashesHandle is alive
+/// - Do NOT free individual strings or the array - they're owned by the handle
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn manifest_hashes_get_allowed_anywhere(
+    hashes: *const ManifestHashesHandle,
+) -> AllowedAnywhereHashes { unsafe {
+    if hashes.is_null() {
+        return AllowedAnywhereHashes {
+            count: 0,
+            hashes: ptr::null(),
+        };
+    }
+
+    let handle = &*hashes;
+    
+    // Build array of pointers to our CStrings
+    let mut hash_ptrs: Vec<*const c_char> = Vec::with_capacity(handle.allowed_anywhere.len());
+    for hash_cstr in &handle.allowed_anywhere {
+        hash_ptrs.push(hash_cstr.as_ptr());
+    }
+    
+    // Leak the Vec so the pointers remain valid
+    let ptrs = hash_ptrs.as_ptr();
+    let count = hash_ptrs.len() as u32;
+    std::mem::forget(hash_ptrs);
+    
+    AllowedAnywhereHashes {
+        count,
+        hashes: ptrs,
+    }
+}}
+
+/// Free a manifest hashes handle
+///
+/// # Safety
+/// - `hashes` must be a valid ManifestHashesHandle pointer or null
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn manifest_hashes_free(hashes: *mut ManifestHashesHandle) { unsafe {
+    if !hashes.is_null() {
+        drop(Box::from_raw(hashes));
+    }
+}}
