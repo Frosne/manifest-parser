@@ -1,9 +1,18 @@
+/* -*- Mode: rust; rust-indent-offset: 4 -*- */
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 use std::{error::Error, fmt};
 
 use std::collections::BTreeMap;
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+
+use std::ffi::CStr;
+use std::ffi::c_char;
+
+
 
 /// Ok, here we implement a custom deserializer for the hashes map
 /// that checks for duplicate keys.
@@ -860,4 +869,50 @@ mod tests {
         );
     }
 
+}
+
+#[repr(C)]
+pub enum ManifestErrorCode {
+    Success = 0,
+    InvalidSyntax = 1,
+    InvalidStructure = 2,
+    UnsupportedVersion = 3,
+    NullPointer = 4,
+    InvalidEncoding = 5,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn manifest_validate(
+    data: *const c_char,
+    data_len: u32,
+) -> ManifestErrorCode {
+    if data.is_null() {
+        return ManifestErrorCode::NullPointer;
+    }
+
+    let manifest_str = if data_len > 0 {
+        let slice = std::slice::from_raw_parts(data as *const u8, data_len as usize);
+        match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return ManifestErrorCode::InvalidEncoding,
+        }
+    } else {
+        match CStr::from_ptr(data).to_str() {
+            Ok(s) => s,
+            Err(_) => return ManifestErrorCode::InvalidEncoding,
+        }
+    };
+
+    // Parse the manifest
+    match parse_manifest_json5(manifest_str) {
+        Ok(_manifest) => ManifestErrorCode::Success,
+        Err(e) => {
+            use crate::ManifestParseError;
+            match e {
+                ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
+                ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
+                ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
+            }
+        }
+    }
 }
