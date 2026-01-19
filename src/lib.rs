@@ -303,6 +303,8 @@ fn is_valid_hex_sha256(s: &str) -> bool {
 }
 
 fn is_valid_sri_hash(s: &str) -> bool {
+    use base64::Engine;
+    
     // Accept sha256-, sha384-, sha512-
     let (alg, b64) = if let Some(rest) = s.strip_prefix("sha256-") {
         ("sha256", rest)
@@ -314,7 +316,7 @@ fn is_valid_sri_hash(s: &str) -> bool {
         return false;
     };
 
-    let bytes = match base64::decode(b64) {
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
         Ok(b) => b,
         Err(_) => return false,
     };
@@ -438,25 +440,29 @@ pub struct Manifest {
     // So we can just remove #[serde(deny_unknown_fields)] in this case
 }
 
-/// Parses this shape of manifests
+/// Parses JSON manifests with this shape:
+/// ```json
+/// {
 ///   "manifest": {
-///     "version": 1, // format of the manifest
+///     "version": 1,
 ///     "integrity-policy": "blocked-destinations=(script), checked-destinations=(wasm)",
-///     "bt-server": "www.mybt.com/com.whatsapp.www ",
+///     "bt-server": "www.mybt.com/com.whatsapp.www",
 ///     "hashes": {
 ///       "/assets/x.html": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
 ///       "/assets/main.js": "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
 ///       "": [
 ///         "3431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
-///       ],
+///       ]
 ///     },
-///     "metadata": "arbitrary data... "
-///  },
-/// Should be updated if https://github.com/w3c/webappsec-subresource-integrity/issues/158#issuecomment-3639242927
+///     "metadata": "arbitrary data..."
+///   }
+/// }
+/// ```
+/// See: https://github.com/w3c/webappsec-subresource-integrity/issues/158#issuecomment-3639242927
 ///
-pub fn parse_manifest_json5(input: &str) -> Result<Manifest, ManifestParseError> {
+pub fn parse_manifest_json(input: &str) -> Result<Manifest, ManifestParseError> {
     let manifest: Manifest =
-        json5::from_str(input).map_err(|e| ManifestParseError::InvalidSyntax {
+        serde_json::from_str(input).map_err(|e| ManifestParseError::InvalidSyntax {
             detail: e.to_string(),
         })?;
 
@@ -564,21 +570,395 @@ pub fn merge_hashes_from_manifests(
     Ok(merge_hashes(h1, h2))
 }
 
+
+#[repr(C)]
+#[derive(PartialEq)]
+pub enum ManifestErrorCode {
+    Success = 0,
+    InvalidSyntax = 1,
+    InvalidStructure = 2,
+    UnsupportedVersion = 3,
+    NullPointer = 4,
+    InvalidEncoding = 5,
+}
+
+/// Validate a manifest without extracting data
+///
+/// # Safety
+/// - `data` must be a valid pointer to UTF-8 encoded string data
+/// - If `data_len` is 0, `data` must be a null-terminated C string
+/// - If `data_len` > 0, `data` must point to at least `data_len` bytes of valid memory
+///
+/// # Arguments
+/// * `data` - Pointer to manifest data (null-terminated if data_len is 0)
+/// * `data_len` - Length of data in bytes, or 0 to treat as null-terminated
+///
+/// # Returns
+/// * `ManifestErrorCode::Success` - Manifest is valid
+/// * `ManifestErrorCode::NullPointer` - `data` is null
+/// * `ManifestErrorCode::InvalidEncoding` - Data is not valid UTF-8
+/// * `ManifestErrorCode::InvalidSyntax` - JSON parsing failed
+/// * `ManifestErrorCode::InvalidStructure` - Manifest structure is invalid
+/// * `ManifestErrorCode::UnsupportedVersion` - Manifest version not supported
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn manifest_validate(data: *const c_char, data_len: u32) -> ManifestErrorCode {
+    if data.is_null() {
+        return ManifestErrorCode::NullPointer;
+    }
+
+    let manifest_str = if data_len > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(data as *const u8, data_len as usize) };
+        match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return ManifestErrorCode::InvalidEncoding,
+        }
+    } else {
+        match unsafe { CStr::from_ptr(data) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return ManifestErrorCode::InvalidEncoding,
+        }
+    };
+
+    // Parse the manifest
+    match parse_manifest_json(manifest_str) {
+        Ok(_manifest) => ManifestErrorCode::Success,
+        Err(e) => match e {
+            ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
+            ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
+            ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
+        },
+    }
+}
+
+
+#[repr(C)]
+pub struct AssetHashPair {
+    // asset path
+    pub path: *const c_char,
+    // hash value
+    pub hash: *const c_char,
+}
+
+#[repr(C)]
+pub struct AssetHashPairs {
+    /// Number of pairs
+    pub count: u32,
+    /// Array of AssetHashPair structs
+    pub pairs: *const AssetHashPair,
+}
+
+/// Flattened structure containing allowed-anywhere hashes
+#[repr(C)]
+pub struct AllowedAnywhereHashes {
+    /// Number of hashes
+    pub count: u32,
+    /// Array of hashes (null-terminated C strings)
+    pub hashes: *const *const c_char,
+}
+
+pub struct ManifestHashesHandle {
+    version: u32,
+    integrity_policy: CString,
+    bt_server: CString,
+    metadata: Option<CString>,  // JSON string
+
+    // Store (path, hash) pairs as CStrings
+    asset_pairs: Vec<(CString, CString)>,
+    // Store allowed-anywhere hashes as CStrings
+    allowed_anywhere: Vec<CString>,
+    
+    // Track leaked allocations for cleanup
+    leaked_asset_pairs: Option<Vec<AssetHashPair>>,
+    leaked_anywhere_ptrs: Option<Vec<*const c_char>>,
+}
+
+impl Drop for ManifestHashesHandle {
+    fn drop(&mut self) {
+        // Clean up leaked allocations
+        if let Some(pairs) = self.leaked_asset_pairs.take() {
+            drop(pairs);
+        }
+        if let Some(ptrs) = self.leaked_anywhere_ptrs.take() {
+            drop(ptrs);
+        }
+    }
+}
+
+
+
+/// Free a manifest hashes handle and all associated resources
+///
+/// # Safety
+/// - `hashes` must be either:
+///   - A valid `ManifestHashesHandle` pointer returned from `manifest_parse_and_get_hashes()`, OR
+///   - NULL (which is safely ignored)
+/// - After calling this function, `hashes` and ALL pointers derived from it become invalid:
+///   - Pointers in `ParsedManifest` structures
+///   - Pointers in `AssetHashPairs` arrays
+///   - Pointers in `AllowedAnywhereHashes` arrays
+///   - All string pointers (paths, hashes, integrity_policy, etc.)
+/// - This function must be called exactly once per handle (double-free is undefined behavior)
+/// - Do not call this function from multiple threads with the same handle
+///
+/// # Arguments
+/// * `hashes` - Handle to free, or NULL
+///
+/// # Example
+/// ```c
+/// ManifestHashesHandle* handle = NULL;
+/// manifest_parse_and_get_hashes(data, len, &handle);
+/// 
+/// ParsedManifest parsed = manifest_get_parsed(handle);
+/// // Use parsed...
+/// 
+/// manifest_hashes_free(handle);
+/// // handle is now invalid!
+/// // parsed.integrity_policy is now invalid!
+/// // All pointers are now invalid!
+/// ```
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn manifest_hashes_free(hashes: *mut ManifestHashesHandle) {
+    if !hashes.is_null() {
+        unsafe {
+            drop(Box::from_raw(hashes));
+        }
+    }
+}
+
+/// To be extended if I missed some fields
+#[repr(C)]
+pub struct ParsedManifest {
+    pub version: u32,
+    // Do we want something more serious here? I.e. a pair of values?
+    pub integrity_policy: *const c_char,
+    pub bt_server: *const c_char,
+    pub metadata: *const c_char,
+    pub asset_pairs: AssetHashPairs,
+    pub allowed_anywhere: AllowedAnywhereHashes,
+}
+
+
+/// Parse a manifest and get all data in one call
+///
+/// This function parses a manifest, validates it, and returns all the parsed data
+/// along with a handle that must be freed.
+///
+/// # Safety
+/// - `data` must be a valid pointer to UTF-8 encoded string data
+/// - If `data_len` is 0, `data` must be a null-terminated C string
+/// - If `data_len` > 0, `data` must point to at least `data_len` bytes of valid memory
+/// - `out_parsed` must be a valid pointer to a `ParsedManifest` structure
+/// - `out_handle` must be a valid pointer to a location where the handle pointer can be written
+/// - The returned handle must be freed with `manifest_hashes_free()` to avoid memory leaks
+/// - The `ParsedManifest` structure written to `out_parsed` is valid only as long as the handle is alive
+/// - Do not call this function from multiple threads with overlapping output pointers
+///
+/// # Arguments
+/// * `data` - Pointer to manifest data (null-terminated if data_len is 0)
+/// * `data_len` - Length of data in bytes, or 0 to treat as null-terminated
+/// * `out_parsed` - Output pointer to receive the parsed manifest structure
+/// * `out_handle` - Output pointer to receive the manifest handle (must be freed)
+///
+/// # Returns
+/// * `ManifestErrorCode::Success` - Parsing succeeded, data written to `out_parsed` and `out_handle`
+/// * `ManifestErrorCode::NullPointer` - One of the pointers is null
+/// * `ManifestErrorCode::InvalidEncoding` - Data is not valid UTF-8
+/// * `ManifestErrorCode::InvalidSyntax` - JSON parsing failed
+/// * `ManifestErrorCode::InvalidStructure` - Manifest structure is invalid
+/// * `ManifestErrorCode::UnsupportedVersion` - Manifest version not supported
+///
+/// # Example
+/// ```c
+/// ParsedManifest parsed;
+/// ManifestHashesHandle* handle = NULL;
+/// 
+/// ManifestErrorCode result = manifest_parse_and_get_all(
+///     json_data, 
+///     strlen(json_data),
+///     &parsed,
+///     &handle
+/// );
+/// 
+/// if (result == ManifestErrorCode::Success) {
+///     printf("Version: %u\n", parsed.version);
+///     printf("Policy: %s\n", parsed.integrity_policy);
+///     
+///     for (uint32_t i = 0; i < parsed.asset_pairs.count; i++) {
+///         printf("%s -> %s\n",
+///                parsed.asset_pairs.pairs[i].path,
+///                parsed.asset_pairs.pairs[i].hash);
+///     }
+///     
+///     manifest_hashes_free(handle);  // Required!
+/// }
+/// ```
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn manifest_parse_and_get_all(
+    data: *const c_char,
+    data_len: u32,
+    out_parsed: *mut ParsedManifest,
+    out_handle: *mut *mut ManifestHashesHandle,
+) -> ManifestErrorCode {
+    if data.is_null() || out_parsed.is_null() || out_handle.is_null() {
+        return ManifestErrorCode::NullPointer;
+    }
+
+    // Convert C string to Rust string
+    let manifest_str = if data_len > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(data as *const u8, data_len as usize) };
+        match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return ManifestErrorCode::InvalidEncoding,
+        }
+    } else {
+        match unsafe { CStr::from_ptr(data) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return ManifestErrorCode::InvalidEncoding,
+        }
+    };
+
+    // Parse the manifest
+    let manifest = match parse_manifest_json(manifest_str) {
+        Ok(m) => m,
+        Err(e) => {
+            return match e {
+                ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
+                ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
+                ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
+            };
+        }
+    };
+
+    // Get hashes from manifest
+    let hashes = match manifest.get_hashes_from_manifest() {
+        Ok(h) => h,
+        Err(e) => {
+            return match e {
+                ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
+                ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
+                ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
+            };
+        }
+    };
+
+    // Convert to CStrings and build pairs
+    let mut asset_pairs_cstrings = Vec::new();
+    for (path, hash_vec) in &hashes.asset_hash_vec {
+        if let Some(hash) = hash_vec.first() {
+            if let (Ok(path_cstr), Ok(hash_cstr)) = 
+                (CString::new(path.as_str()), CString::new(hash.as_str())) {
+                asset_pairs_cstrings.push((path_cstr, hash_cstr));
+            }
+        }
+    }
+
+    // Convert allowed-anywhere hashes to CStrings
+    let mut allowed_anywhere_cstrings = Vec::new();
+    for hash in &hashes.allowed_anywhere_hash_vec {
+        if let Ok(hash_cstr) = CString::new(hash.as_str()) {
+            allowed_anywhere_cstrings.push(hash_cstr);
+        }
+    }
+
+    let version = manifest.version;
+    
+    let integrity_policy = match CString::new(manifest.integrity_policy.as_str()) {
+        Ok(s) => s,
+        Err(_) => return ManifestErrorCode::InvalidEncoding,
+    };
+    
+    let bt_server = match CString::new(manifest.bt_server.as_str()) {
+        Ok(s) => s,
+        Err(_) => return ManifestErrorCode::InvalidEncoding,
+    };
+    
+    let metadata = if let Some(meta) = &manifest.metadata {
+        match serde_json::to_string(meta) {
+            Ok(json_str) => match CString::new(json_str) {
+                Ok(s) => Some(s),
+                Err(_) => return ManifestErrorCode::InvalidEncoding,
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    // Create the handle
+    let mut handle = Box::new(ManifestHashesHandle {
+        version,
+        integrity_policy,
+        bt_server,
+        metadata,
+        asset_pairs: asset_pairs_cstrings,
+        allowed_anywhere: allowed_anywhere_cstrings,
+        leaked_asset_pairs: None,
+        leaked_anywhere_ptrs: None,
+    });
+
+    // Build the asset pairs array
+    let mut asset_pairs_array: Vec<AssetHashPair> = Vec::with_capacity(handle.asset_pairs.len());
+    for (path_cstr, hash_cstr) in &handle.asset_pairs {
+        asset_pairs_array.push(AssetHashPair {
+            path: path_cstr.as_ptr(),
+            hash: hash_cstr.as_ptr(),
+        });
+    }
+    
+    let asset_pairs_ptr = asset_pairs_array.as_ptr();
+    let asset_pairs_count = asset_pairs_array.len() as u32;
+    handle.leaked_asset_pairs = Some(asset_pairs_array);
+    
+    // Build the allowed-anywhere array
+    let mut hash_ptrs_array: Vec<*const c_char> = Vec::with_capacity(handle.allowed_anywhere.len());
+    for hash_cstr in &handle.allowed_anywhere {
+        hash_ptrs_array.push(hash_cstr.as_ptr());
+    }
+
+    let hash_ptrs_ptr = hash_ptrs_array.as_ptr();
+    let hash_ptrs_count = hash_ptrs_array.len() as u32;
+    handle.leaked_anywhere_ptrs = Some(hash_ptrs_array);
+
+    // Build the ParsedManifest structure
+    let parsed = ParsedManifest {
+        version: handle.version,
+        integrity_policy: handle.integrity_policy.as_ptr(),
+        bt_server: handle.bt_server.as_ptr(),
+        metadata: handle.metadata.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
+        asset_pairs: AssetHashPairs {
+            count: asset_pairs_count,
+            pairs: asset_pairs_ptr,
+        },
+        allowed_anywhere: AllowedAnywhereHashes {
+            count: hash_ptrs_count,
+            hashes: hash_ptrs_ptr,
+        },
+    };
+
+    // Write outputs
+    unsafe {
+        *out_parsed = parsed;
+        *out_handle = Box::into_raw(handle);
+    }
+
+    ManifestErrorCode::Success
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn valid_manifest() {
-        let input = include_str!("../tests/manifests/valid_manifest.json5");
-        let manifest = parse_manifest_json5(input);
+        let input = include_str!("../tests/manifests/valid_manifest.json");
+        let manifest = parse_manifest_json(input);
         assert!(manifest.is_ok(), "expected Ok, got {:?}", manifest);
     }
 
     #[test]
     fn valid_manifest_parse_and_validate_ok() {
-        let input = include_str!("../tests/manifests/valid_manifest.json5");
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let input = include_str!("../tests/manifests/valid_manifest.json");
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             manifest.is_ok(),
             "expected Ok after parse + validate, got {:?}",
@@ -588,8 +968,8 @@ mod tests {
 
     #[test]
     fn valid_manifest_hashes_are_extracted_correctly() {
-        let input = include_str!("../tests/manifests/valid_manifest.json5");
-        let manifest = parse_manifest_json5(input).expect("manifest should parse");
+        let input = include_str!("../tests/manifests/valid_manifest.json");
+        let manifest = parse_manifest_json(input).expect("manifest should parse");
         let hashes = manifest
             .get_hashes_from_manifest()
             .expect("hashes should be valid");
@@ -626,8 +1006,8 @@ mod tests {
 
     #[test]
     fn valid_manifest_hashes_are_extracted_correctly_merging_two_manifests() {
-        let input = include_str!("../tests/manifests/valid_manifest.json5");
-        let manifest = parse_manifest_json5(input).expect("manifest should parse");
+        let input = include_str!("../tests/manifests/valid_manifest.json");
+        let manifest = parse_manifest_json(input).expect("manifest should parse");
         let merged_hashes =
             merge_hashes_from_manifests(&manifest, &manifest).expect("merge should succeed");
 
@@ -645,12 +1025,12 @@ mod tests {
 
     #[test]
     fn valid_manifest_hashes_are_extracted_correctly_merging_two_different_manifests() {
-        let input0 = include_str!("../tests/manifests/valid_manifest.json5");
-        let input1 = include_str!("../tests/manifests/valid_manifest1.json5");
+        let input0 = include_str!("../tests/manifests/valid_manifest.json");
+        let input1 = include_str!("../tests/manifests/valid_manifest1.json");
 
         // The manifest0 is "younger" than manifest1, so its hashes should appear first.
-        let manifest0 = parse_manifest_json5(input0).expect("manifest should parse");
-        let manifest1 = parse_manifest_json5(input1).expect("manifest should parse");
+        let manifest0 = parse_manifest_json(input0).expect("manifest should parse");
+        let manifest1 = parse_manifest_json(input1).expect("manifest should parse");
         let merged_hashes =
             merge_hashes_from_manifests(&manifest0, &manifest1).expect("merge should succeed");
 
@@ -696,15 +1076,15 @@ mod tests {
 
     #[test]
     fn valid_changed_order_manifest() {
-        let input = include_str!("../tests/manifests/valid_manifest_changed_order.json5");
-        let manifest = parse_manifest_json5(input);
+        let input = include_str!("../tests/manifests/valid_manifest_changed_order.json");
+        let manifest = parse_manifest_json(input);
         assert!(manifest.is_ok(), "expected Ok, got {:?}", manifest);
     }
 
     #[test]
     fn invalid_manifest_missing_brackets() {
-        let input = include_str!("../tests/manifests/invalid_manifest_missing_brackets.json5");
-        let manifest = parse_manifest_json5(input);
+        let input = include_str!("../tests/manifests/invalid_manifest_missing_brackets.json");
+        let manifest = parse_manifest_json(input);
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidSyntax { .. })),
             "expected InvalidSyntax, got {:?}",
@@ -715,8 +1095,8 @@ mod tests {
     #[test]
     fn invalid_manifest_unsupported_version() {
         let input =
-            include_str!("../tests/manifests/invalid_manifest_unsupported_version.json5");
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+            include_str!("../tests/manifests/invalid_manifest_unsupported_version.json");
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(
                 manifest,
@@ -729,8 +1109,8 @@ mod tests {
 
     #[test]
     fn invalid_manifest_blocked_destinations_bad_value() {
-        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_blocked_destinations_bad_value.json5");
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_blocked_destinations_bad_value.json");
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -740,8 +1120,8 @@ mod tests {
 
     #[test]
     fn invalid_manifest_blocked_destinations_missing_paren() {
-        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_blocked_destinations_missing_paren.json5");
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let input = include_str!("../tests/manifests/integrity-policy/invalid_manifest_blocked_destinations_missing_paren.json");
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -752,9 +1132,9 @@ mod tests {
     #[test]
     fn invalid_manifest_empty_integrity_policy() {
         let input = include_str!(
-            "../tests/manifests/integrity-policy/invalid_manifest_empty_integrity_policy.json5"
+            "../tests/manifests/integrity-policy/invalid_manifest_empty_integrity_policy.json"
         );
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -765,9 +1145,9 @@ mod tests {
     #[test]
     fn invalid_manifest_missing_equals() {
         let input = include_str!(
-            "../tests/manifests/integrity-policy/invalid_manifest_missing_equals.json5"
+            "../tests/manifests/integrity-policy/invalid_manifest_missing_equals.json"
         );
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -778,9 +1158,9 @@ mod tests {
     #[test]
     fn invalid_manifest_sources_bad_value() {
         let input = include_str!(
-            "../tests/manifests/integrity-policy/invalid_manifest_sources_bad_value.json5"
+            "../tests/manifests/integrity-policy/invalid_manifest_sources_bad_value.json"
         );
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -791,9 +1171,9 @@ mod tests {
     #[test]
     fn invalid_manifest_unknown_directive_integrity() {
         let input = include_str!(
-            "../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json5"
+            "../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json"
         );
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -803,8 +1183,8 @@ mod tests {
 
     #[test]
     fn invalid_manifest_incorrect_bt_server() {
-        let input = include_str!("../tests/manifests/invalid_manifest_incorrect_bt_server.json5");
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let input = include_str!("../tests/manifests/invalid_manifest_incorrect_bt_server.json");
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -850,8 +1230,8 @@ mod tests {
     #[test]
     fn invalid_manifest_duplicate_hash_key() {
         let input =
-            include_str!("../tests/manifests/hashes/invalid_manifest_duplicate_hash_key.json5");
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+            include_str!("../tests/manifests/hashes/invalid_manifest_duplicate_hash_key.json");
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidSyntax { .. })),
             "expected InvalidSyntax, got {:?}",
@@ -861,8 +1241,8 @@ mod tests {
 
     #[test]
     fn invalid_manifest_empty_hash() {
-        let input = include_str!("../tests/manifests/hashes/invalid_manifest_empty_hash.json5");
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let input = include_str!("../tests/manifests/hashes/invalid_manifest_empty_hash.json");
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -873,8 +1253,8 @@ mod tests {
     #[test]
     fn invalid_manifest_spaces_in_key() {
         let input =
-            include_str!("../tests/manifests/hashes/invalid_manifest_spaces_in_key.json5");
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+            include_str!("../tests/manifests/hashes/invalid_manifest_spaces_in_key.json");
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -884,17 +1264,17 @@ mod tests {
 
     #[test]
     fn valid_manifest_metadata_optional() {
-        let input = include_str!("../tests/manifests/valid_manifest_metadata_optional.json5");
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let input = include_str!("../tests/manifests/valid_manifest_metadata_optional.json");
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(manifest.is_ok(), "expected Ok, got {:?}", manifest);
     }
 
     #[test]
     fn invalid_manifest_unknown_directive() {
         let input = include_str!(
-            "../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json5"
+            "../tests/manifests/integrity-policy/invalid_manifest_unknown_directive.json"
         );
-        let manifest = parse_manifest_json5(input).and_then(|m| validate_manifest_structure(&m));
+        let manifest = parse_manifest_json(input).and_then(|m| validate_manifest_structure(&m));
         assert!(
             matches!(manifest, Err(ManifestParseError::InvalidStructure { .. })),
             "expected InvalidStructure, got {:?}",
@@ -904,8 +1284,8 @@ mod tests {
 
     #[test]
     fn valid_manifest_sorting_anywhere_hashed(){
-        let input = include_str!("../tests/manifests/valid_manifest_sorting_anywhere_hashes.json5");
-        let manifest = parse_manifest_json5(input).expect("manifest should parse");
+        let input = include_str!("../tests/manifests/valid_manifest_sorting_anywhere_hashes.json");
+        let manifest = parse_manifest_json(input).expect("manifest should parse");
         let hashes = manifest
             .get_hashes_from_manifest()
             .expect("hashes should be valid");
@@ -929,252 +1309,7 @@ mod tests {
         );
     }
 }
-
-#[repr(C)]
-pub enum ManifestErrorCode {
-    Success = 0,
-    InvalidSyntax = 1,
-    InvalidStructure = 2,
-    UnsupportedVersion = 3,
-    NullPointer = 4,
-    InvalidEncoding = 5,
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn manifest_validate(data: *const c_char, data_len: u32) -> ManifestErrorCode { unsafe {
-    if data.is_null() {
-        return ManifestErrorCode::NullPointer;
-    }
-
-    let manifest_str = if data_len > 0 {
-        let slice = std::slice::from_raw_parts(data as *const u8, data_len as usize);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s,
-            Err(_) => return ManifestErrorCode::InvalidEncoding,
-        }
-    } else {
-        match CStr::from_ptr(data).to_str() {
-            Ok(s) => s,
-            Err(_) => return ManifestErrorCode::InvalidEncoding,
-        }
-    };
-
-    // Parse the manifest
-    match parse_manifest_json5(manifest_str) {
-        Ok(_manifest) => ManifestErrorCode::Success,
-        Err(e) => match e {
-            ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
-            ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
-            ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
-        },
-    }
-}}
-
-
-#[repr(C)]
-pub struct AssetHashPair {
-    // asset path
-    pub path: *const c_char,
-    // hash value
-    pub hash: *const c_char,
-}
-
-#[repr(C)]
-pub struct AssetHashPairs {
-    /// Number of pairs
-    pub count: u32,
-    /// Array of AssetHashPair structs
-    pub pairs: *const AssetHashPair,
-}
-
-/// Flattened structure containing allowed-anywhere hashes
-#[repr(C)]
-pub struct AllowedAnywhereHashes {
-    /// Number of hashes
-    pub count: u32,
-    /// Array of hashes (null-terminated C strings)
-    pub hashes: *const *const c_char,
-}
-pub struct ManifestHashesHandle {
-    // Store (path, hash) pairs as CStrings
-    asset_pairs: Vec<(CString, CString)>,
-    // Store allowed-anywhere hashes as CStrings
-    allowed_anywhere: Vec<CString>,
-}
-
-#[unsafe(no_mangle)]
-/// Parse a manifest and extract hashes
-/// 
-/// # Safety
-/// - `data` must be a valid pointer to a null-terminated C string
-/// - `data_len` is the length of the data in bytes
-/// - `out_hashes` must be a valid pointer to write the result
-/// - The returned handle must be freed with `manifest_hashes_free`
-/// #[unsafe(no_mangle)]
-pub unsafe extern "C" fn manifest_parse_and_get_hashes(
-    data: *const c_char,
-    data_len: u32,
-    out_hashes: *mut *mut ManifestHashesHandle,
-) -> ManifestErrorCode { unsafe {
-    // Check for null pointers
-    if data.is_null() || out_hashes.is_null() {
-        return ManifestErrorCode::NullPointer;
-    }
-
-    // Convert C string to Rust string
-    let manifest_str = if data_len > 0 {
-        let slice = std::slice::from_raw_parts(data as *const u8, data_len as usize);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s,
-            Err(_) => return ManifestErrorCode::InvalidEncoding,
-        }
-    } else {
-        match CStr::from_ptr(data).to_str() {
-            Ok(s) => s,
-            Err(_) => return ManifestErrorCode::InvalidEncoding,
-        }
-    };
-
-    // Parse the manifest
-    let manifest = match parse_manifest_json5(manifest_str) {
-        Ok(m) => m,
-        Err(e) => {
-            use crate::ManifestParseError;
-            return match e {
-                ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
-                ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
-                ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
-            };
-        }
-    };
-
-    // Get hashes from manifest
-    let hashes = match manifest.get_hashes_from_manifest() {
-        Ok(h) => h,
-        Err(e) => {
-            use crate::ManifestParseError;
-            return match e {
-                ManifestParseError::InvalidSyntax { .. } => ManifestErrorCode::InvalidSyntax,
-                ManifestParseError::InvalidStructure { .. } => ManifestErrorCode::InvalidStructure,
-                ManifestParseError::UnsupportedVersion { .. } => ManifestErrorCode::UnsupportedVersion,
-            };
-        }
-    };
-
-    // Convert to CStrings and build pairs
-    // Note: Each asset path maps to exactly one hash (takes first hash from vec)
-    let mut asset_pairs = Vec::new();
-
-    for (path, hash_vec) in &hashes.asset_hash_vec {
-        // Take the first hash - per validation rules, assets should only have one hash
-        if let Some(hash) = hash_vec.first() {
-            if let (Ok(path_cstr), Ok(hash_cstr)) = (CString::new(path.as_str()), CString::new(hash.as_str())) {
-                asset_pairs.push((path_cstr, hash_cstr));
-            }
-        }
-    }
-
-    // Convert allowed-anywhere hashes to CStrings
-    let mut allowed_anywhere = Vec::new();
-
-    for hash in &hashes.allowed_anywhere_hash_vec {
-        if let Ok(hash_cstr) = CString::new(hash.as_str()) {
-            allowed_anywhere.push(hash_cstr);
-        }
-    }
-
-    // Create handle and return
-    let handle = Box::new(ManifestHashesHandle {
-        asset_pairs,
-        allowed_anywhere,
-    });
-    *out_hashes = Box::into_raw(handle);
-    ManifestErrorCode::Success
-}}
-
-/// Get asset hash pairs
-///
-/// # Safety
-/// - `hashes` must be a valid ManifestHashesHandle pointer
-/// - The returned structure's pointers are valid as long as the ManifestHashesHandle is alive
-/// - Do NOT free individual strings or the array - they're owned by the handle
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn manifest_hashes_get_asset_pairs(
-    hashes: *const ManifestHashesHandle,
-) -> AssetHashPairs { unsafe {
-    if hashes.is_null() {
-        return AssetHashPairs {
-            count: 0,
-            pairs: ptr::null(),
-        };
-    }
-
-    let handle = &*hashes;
-    
-    // Build array of AssetHashPair structs with pointers into our CStrings
-    let mut pairs: Vec<AssetHashPair> = Vec::with_capacity(handle.asset_pairs.len());
-    for (path_cstr, hash_cstr) in &handle.asset_pairs {
-        pairs.push(AssetHashPair {
-            path: path_cstr.as_ptr(),
-            hash: hash_cstr.as_ptr(),
-        });
-    }
-    
-    // Leak the Vec so the pointers remain valid
-    // They'll be cleaned up when the handle is freed
-    let pairs_ptr = pairs.as_ptr();
-    let count = pairs.len() as u32;
-    std::mem::forget(pairs);
-    
-    AssetHashPairs {
-        count,
-        pairs: pairs_ptr,
-    }
-}}
-
-/// Get allowed-anywhere hashes
-///
-/// # Safety
-/// - `hashes` must be a valid ManifestHashesHandle pointer
-/// - The returned structure's pointers are valid as long as the ManifestHashesHandle is alive
-/// - Do NOT free individual strings or the array - they're owned by the handle
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn manifest_hashes_get_allowed_anywhere(
-    hashes: *const ManifestHashesHandle,
-) -> AllowedAnywhereHashes { unsafe {
-    if hashes.is_null() {
-        return AllowedAnywhereHashes {
-            count: 0,
-            hashes: ptr::null(),
-        };
-    }
-
-    let handle = &*hashes;
-    
-    // Build array of pointers to our CStrings
-    let mut hash_ptrs: Vec<*const c_char> = Vec::with_capacity(handle.allowed_anywhere.len());
-    for hash_cstr in &handle.allowed_anywhere {
-        hash_ptrs.push(hash_cstr.as_ptr());
-    }
-    
-    // Leak the Vec so the pointers remain valid
-    let ptrs = hash_ptrs.as_ptr();
-    let count = hash_ptrs.len() as u32;
-    std::mem::forget(hash_ptrs);
-    
-    AllowedAnywhereHashes {
-        count,
-        hashes: ptrs,
-    }
-}}
-
-/// Free a manifest hashes handle
-///
-/// # Safety
-/// - `hashes` must be a valid ManifestHashesHandle pointer or null
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn manifest_hashes_free(hashes: *mut ManifestHashesHandle) { unsafe {
-    if !hashes.is_null() {
-        drop(Box::from_raw(hashes));
-    }
-}}
+/* -*- Mode: rust; rust-indent-offset: 4 -*- */
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
