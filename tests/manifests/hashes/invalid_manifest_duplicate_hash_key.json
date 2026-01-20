@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "waict-integrity-version": 1,
   "integrity-policy": "blocked-destinations=(script)",
   "bt-server": "example.com",
   "hashes": {

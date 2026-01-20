@@ -1,5 +1,5 @@
 {
-  "version": 20,
+  "waict-integrity-version": 20,
   "integrity-policy": "blocked-destinations=(script), checked-destinations=(wasm)",
   "bt-server": "www.mybt.com/com.whatsapp.www",
   "hashes": {

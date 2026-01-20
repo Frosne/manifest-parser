@@ -420,8 +420,10 @@ fn validate_hashes(hashes: &BTreeMap<String, HashValue>) -> Result<(), ManifestP
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    #[serde(rename = "waict-integrity-version")]
     pub version: u32,
 
+    // It looks like it got renamed from "integrity-policy" to "blocked-destinations"
     #[serde(rename = "integrity-policy")]
     pub integrity_policy: String,
 
@@ -433,33 +435,17 @@ pub struct Manifest {
 
     /// Optional metadata field
     pub metadata: Option<serde_json::Value>,
+    /// Optional resource_delimiter field
+    #[serde(rename = "resource-delimiter")]
+    pub resource_delimiter: Option<String>,
+    /// Optional transparency_proof field
+    #[serde(rename = "transparency-proof")]
+    pub transparency_proof: Option<String>
 
-    // I've figured out that there might be other fields in the manifest in the future,
-    // for example, "resource_delimeter": "/* MY_DELIM */"
-    // https://github.com/w3c/webappsec-subresource-integrity/issues/163
-    // So we can just remove #[serde(deny_unknown_fields)] in this case
+    // It's possible that we will have more fields in the future
 }
 
-/// Parses JSON manifests with this shape:
-/// ```json
-/// {
-///   "manifest": {
-///     "version": 1,
-///     "integrity-policy": "blocked-destinations=(script), checked-destinations=(wasm)",
-///     "bt-server": "www.mybt.com/com.whatsapp.www",
-///     "hashes": {
-///       "/assets/x.html": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
-///       "/assets/main.js": "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
-///       "": [
-///         "3431742b9dbff1751bba9ba47483ed62ae7fdf42d560a480a282af38b6c8de0a"
-///       ]
-///     },
-///     "metadata": "arbitrary data..."
-///   }
-/// }
-/// ```
-/// See: https://github.com/w3c/webappsec-subresource-integrity/issues/158#issuecomment-3639242927
-///
+/// Parses JSON manifests. See tests for valid (and invalid) examples.
 pub fn parse_manifest_json(input: &str) -> Result<Manifest, ManifestParseError> {
     let manifest: Manifest =
         serde_json::from_str(input).map_err(|e| ManifestParseError::InvalidSyntax {
@@ -489,6 +475,8 @@ fn validate_manifest_structure(m: &Manifest) -> Result<(), ManifestParseError> {
 
     validate_bt_server(&m.bt_server)?;
     validate_hashes(&m.hashes)?;
+
+    // No validation for metadata, resource_delimiter, transparency_proof.
 
     Ok(())
 }
@@ -666,7 +654,7 @@ pub struct ManifestHashesHandle {
     asset_pairs: Vec<(CString, CString)>,
     // Store allowed-anywhere hashes as CStrings
     allowed_anywhere: Vec<CString>,
-    
+
     // Track leaked allocations for cleanup
     leaked_asset_pairs: Option<Vec<AssetHashPair>>,
     leaked_anywhere_ptrs: Option<Vec<*const c_char>>,
@@ -684,8 +672,6 @@ impl Drop for ManifestHashesHandle {
     }
 }
 
-
-
 /// Free a manifest hashes handle and all associated resources
 ///
 /// # Safety
@@ -702,19 +688,6 @@ impl Drop for ManifestHashesHandle {
 ///
 /// # Arguments
 /// * `hashes` - Handle to free, or NULL
-///
-/// # Example
-/// ```c
-/// ManifestHashesHandle* handle = NULL;
-/// manifest_parse_and_get_hashes(data, len, &handle);
-/// 
-/// ParsedManifest parsed = manifest_get_parsed(handle);
-/// // Use parsed...
-/// 
-/// manifest_hashes_free(handle);
-/// // handle is now invalid!
-/// // parsed.integrity_policy is now invalid!
-/// // All pointers are now invalid!
 /// ```
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn manifest_hashes_free(hashes: *mut ManifestHashesHandle) {
@@ -736,7 +709,6 @@ pub struct ParsedManifest {
     pub asset_pairs: AssetHashPairs,
     pub allowed_anywhere: AllowedAnywhereHashes,
 }
-
 
 /// Parse a manifest and get all data in one call
 ///
@@ -760,37 +732,7 @@ pub struct ParsedManifest {
 /// * `out_handle` - Output pointer to receive the manifest handle (must be freed)
 ///
 /// # Returns
-/// * `ManifestErrorCode::Success` - Parsing succeeded, data written to `out_parsed` and `out_handle`
-/// * `ManifestErrorCode::NullPointer` - One of the pointers is null
-/// * `ManifestErrorCode::InvalidEncoding` - Data is not valid UTF-8
-/// * `ManifestErrorCode::InvalidSyntax` - JSON parsing failed
-/// * `ManifestErrorCode::InvalidStructure` - Manifest structure is invalid
-/// * `ManifestErrorCode::UnsupportedVersion` - Manifest version not supported
-///
-/// # Example
-/// ```c
-/// ParsedManifest parsed;
-/// ManifestHashesHandle* handle = NULL;
-/// 
-/// ManifestErrorCode result = manifest_parse_and_get_all(
-///     json_data, 
-///     strlen(json_data),
-///     &parsed,
-///     &handle
-/// );
-/// 
-/// if (result == ManifestErrorCode::Success) {
-///     printf("Version: %u\n", parsed.version);
-///     printf("Policy: %s\n", parsed.integrity_policy);
-///     
-///     for (uint32_t i = 0; i < parsed.asset_pairs.count; i++) {
-///         printf("%s -> %s\n",
-///                parsed.asset_pairs.pairs[i].path,
-///                parsed.asset_pairs.pairs[i].hash);
-///     }
-///     
-///     manifest_hashes_free(handle);  // Required!
-/// }
+/// *   ManifestErrorCode - manifest parsing and validation result
 /// ```
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn manifest_parse_and_get_all(
@@ -1309,7 +1251,3 @@ mod tests {
         );
     }
 }
-/* -*- Mode: rust; rust-indent-offset: 4 -*- */
-/* This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
